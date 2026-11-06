@@ -1,7 +1,7 @@
 # utils
 
 Reusable GitHub Actions workflows shared by Voom, VoomTV and Woom-Toon.
-Callers pin the major tag (`@v1`); the tag is moved forward for compatible fixes.
+Callers reference `@main`. Once a `v1` release tag exists, switch callers to `@v1` so changes here don't hit every repo at once.
 
 | Workflow | Purpose | Key inputs |
 |---|---|---|
@@ -18,7 +18,7 @@ Example caller:
 ```yaml
 jobs:
   branch-flow:
-    uses: ZyFeronix/utils/.github/workflows/branch-flow.yml@v1
+    uses: ZyFeronix/utils/.github/workflows/branch-flow.yml@main
 ```
 
 This repository is public: never put secrets in these files. Pass them from the caller.

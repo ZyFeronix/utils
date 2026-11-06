@@ -77,7 +77,7 @@ jobs:
   smoke:
     name: Smoke
     needs: plan
-    uses: ZyFeronix/utils/.github/workflows/docker-smoke.yml@v1
+    uses: ZyFeronix/utils/.github/workflows/docker-smoke.yml@main
     with:
       smoke-script: ${{ inputs.smoke-script }}
       max-image-mb: ${{ inputs.max-image-mb }}

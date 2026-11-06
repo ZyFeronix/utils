@@ -1,0 +1,155 @@
+name: Docker publish
+
+# Reusable: smoke-tests the image on amd64 + arm64, then publishes it to GHCR as a multi-arch image.
+#   main  -> :latest  (+ :X.Y.Z and git tag vX.Y.Z when `release-version` is true)
+#   beta  -> :beta
+#   other -> :manual  (workflow_dispatch from any other branch)
+# If any smoke test fails nothing is published. Free-plan friendly: layer cache lives in
+# Actions (never in the registry), no provenance/SBOM manifests, and "untagged" package versions are
+# never pruned (a multi-arch image's per-arch manifests are untagged and deleting them breaks it).
+# Roll back with image@sha256:... (the digest is in the run summary).
+#
+# The caller must grant `permissions: { contents: write, packages: write }`.
+
+on:
+  workflow_call:
+    inputs:
+      smoke-script:
+        type: string
+        default: scripts/docker-smoke.sh
+      max-image-mb:
+        type: string
+        default: '0'
+      release-version:
+        description: On main, also publish :X.Y.Z from version-file and create the git tag vX.Y.Z (fails if it already exists)
+        type: boolean
+        default: false
+      version-file:
+        type: string
+        default: frontend/package.json
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan tags
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      tags: ${{ steps.plan.outputs.tags }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: plan
+        env:
+          REF: ${{ github.ref }}
+          RELEASE: ${{ inputs.release-version }}
+          VERSION_FILE: ${{ inputs.version-file }}
+        run: |
+          # GHCR requires lowercase names (the owner is ZyFeronix).
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          version=""
+          case "$REF" in
+            refs/heads/main)
+              tags="latest"
+              if [ "$RELEASE" = true ]; then
+                version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -n1)"
+                [ -n "$version" ] || { echo "::error::No version found in $VERSION_FILE."; exit 1; }
+                if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
+                  echo "::error::Tag v${version} already exists. Bump the version in $VERSION_FILE before promoting to main."
+                  exit 1
+                fi
+                tags="$tags $version"
+              fi ;;
+            refs/heads/beta) tags="beta" ;;
+            *) tags="manual" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            for t in $tags; do echo "type=raw,value=$t"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: Smoke
+    needs: plan
+    uses: ZyFeronix/utils/.github/workflows/docker-smoke.yml@v1
+    with:
+      smoke-script: ${{ inputs.smoke-script }}
+      max-image-mb: ${{ inputs.max-image-mb }}
+      cache-write: true
+
+  publish:
+    name: Publish multi-arch
+    needs: [plan, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # git tag (only used when release-version is true)
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata (tags and OCI labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.plan.outputs.image }}
+          tags: ${{ needs.plan.outputs.tags }}
+
+      # The layers are already in the cache from the smoke jobs: this step mostly just packages them.
+      - name: Build and publish
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=${{ github.event.repository.name }}-amd64
+            type=gha,scope=${{ github.event.repository.name }}-arm64
+
+      # Only after the image was published successfully.
+      - name: Create git tag
+        if: needs.plan.outputs.version != ''
+        env:
+          TAG: v${{ needs.plan.outputs.version }}
+        run: |
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Published image"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo
+            echo "Digest (to pin or roll back): \`${IMAGE}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,49 @@
+name: Sync to GitLab
+
+# Reusable: mirrors the given branches and all tags to GitLab.
+# Only the needed refs are fetched (no refs/pull/*), so a run takes well under a minute.
+# Call it from a `push` workflow; keep `concurrency` (cancel-in-progress: false) in the caller.
+
+on:
+  workflow_call:
+    inputs:
+      gitlab-repo:
+        description: Repository name on GitLab (e.g. voom)
+        type: string
+        required: true
+      gitlab-path:
+        description: GitLab host and group path, without protocol
+        type: string
+        default: git.alexdevuwu.com/organizations/zyferonix
+      branches:
+        description: Space-separated branches to mirror (dev is deliberately excluded)
+        type: string
+        default: main beta
+    secrets:
+      GITLAB_ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Mirror to GitLab
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - name: Mirror
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.gitlab-path }}/${{ inputs.gitlab-repo }}.git
+          BRANCHES: ${{ inputs.branches }}
+        run: |
+          set -euo pipefail
+          refspecs=()
+          for b in $BRANCHES; do refspecs+=("+refs/heads/$b:refs/heads/$b"); done
+          refspecs+=("+refs/tags/*:refs/tags/*")
+          git init --bare --quiet repo
+          cd repo
+          git fetch --quiet --no-tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${refspecs[@]}"
+          git push --prune "https://oauth2:${GITLAB_TOKEN}@${TARGET}" "${refspecs[@]}"

@@ -1,0 +1,114 @@
+name: Docker smoke
+
+# Reusable: builds the image for amd64 AND arm64 (QEMU) and runs the app's smoke test.
+# Nothing is pushed. Used by PR checks and as the gate of docker-publish.yml.
+#
+# Contract with the app repo: `<smoke-script> <image> <platform>` exits non-zero on failure
+# and reads MAX_IMAGE_MB, SMOKE_WAIT_TRIES and SMOKE_RESTARTS from the environment.
+
+on:
+  workflow_call:
+    inputs:
+      smoke-script:
+        type: string
+        default: scripts/docker-smoke.sh
+      max-image-mb:
+        description: Uncompressed size budget per architecture (0 = unchecked)
+        type: string
+        default: '0'
+      packaging-paths:
+        description: Extended regex of packaging files; when set, the build is skipped on PRs that don't touch them
+        type: string
+        default: ''
+      compose-profiles:
+        description: Space-separated COMPOSE_PROFILES values to validate ("default" = none); empty = skip
+        type: string
+        default: ''
+      cache-write:
+        description: Write the layer cache (use on main/beta only; PRs just read it)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Packaging changed?
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: check
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PATHS: ${{ inputs.packaging-paths }}
+        run: |
+          if [ -z "$PATHS" ] || [ -z "$BASE" ] || git diff --name-only "$BASE" HEAD | grep -Eq "$PATHS"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No packaging changes: skipping the image build."
+          fi
+
+  smoke:
+    name: Docker image (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, platform: linux/amd64, wait: '60', restarts: '10' }
+          # arm64 is emulated (QEMU): startup is much slower.
+          - { arch: arm64, platform: linux/arm64, wait: '180', restarts: '4' }
+    env:
+      CACHE_SCOPE: ${{ github.event.repository.name }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+        if: matrix.arch == 'arm64'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build (${{ matrix.platform }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: smoke:local
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: ${{ inputs.cache-write && format('type=gha,scope={0},mode=max', env.CACHE_SCOPE) || '' }}
+
+      - name: Smoke test
+        env:
+          MAX_IMAGE_MB: ${{ inputs.max-image-mb }}
+          SMOKE_WAIT_TRIES: ${{ matrix.wait }}
+          SMOKE_RESTARTS: ${{ matrix.restarts }}
+          SCRIPT: ${{ inputs.smoke-script }}
+          PLATFORM: ${{ matrix.platform }}
+        run: ./"$SCRIPT" smoke:local "$PLATFORM"
+
+      - name: Validate docker-compose.yml
+        if: inputs.compose-profiles != '' && matrix.arch == 'amd64'
+        env:
+          DOMAIN: example.com
+          PROFILES: ${{ inputs.compose-profiles }}
+        run: |
+          for p in $PROFILES; do
+            [ "$p" = default ] && p=""
+            COMPOSE_PROFILES="$p" docker compose config -q
+          done
